@@ -1,64 +1,59 @@
-import torch.nn as nn
-import sys
-sys.path.append(r'C:\Users\Rain\Desktop\four_one\code\ROADecoder\GAMSNet_OA')
-from networks.backbone import build_ResNet
-from networks.decoder import build_decoder,build_decoder2
-from networks.intersection import build_erase
+from __future__ import annotations
+
 import torch
-from networks.dinknet import BAM_LinkNet50,BAM_LinkNet50_T,LinkNet50_T
-# from networks.swin_transformer import SwinTransformer
+import torch.nn as nn
+from torchvision.models import ResNet50_Weights, resnet50
 
-class GAMSNet_OAM(nn.Module):
-    def __init__(self):
-        super(GAMSNet_OAM, self).__init__()
-        self.erase_channel=2
-        self.resnet = BAM_LinkNet50_T()
-        self.decoder = build_decoder()
-        self.erase = build_erase(erase_channel=self.erase_channel)
-        self.deconv = nn.Sequential(nn.ConvTranspose2d(64, 64, 3, stride=2, padding=1, output_padding=1),
-                                    nn.BatchNorm2d(64),
-                                    nn.ReLU(),
-                                    nn.Conv2d(64, 64, 1, bias=False),
-                                    nn.BatchNorm2d(64),
-                                    nn.ReLU(),
-                                    )
-        self.finalconv = nn.Conv2d(64+self.erase_channel,1,1)
-    def forward(self,x):
-        e1, e2, e3, e4=self.resnet(x)
-        x = self.decoder(e1, e2, e3, e4)
-        x1 = self.erase(x)
-        x2 = self.deconv(x)
-        x2 = torch.cat((x1, x2),dim=1)
-        x = self.finalconv(x2)
-        return torch.sigmoid(x)
-if __name__ == "__main__":
-    import torch
-    from tqdm import tqdm
-    from thop import profile
-    model = GAMSNet_OAM().cuda()
-    input = torch.rand(2, 3, 256, 256).cuda()
+from networks.decoder import build_decoder
+from networks.intersection import build_erase
 
-    iterations = 50
-    starter, ender = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    # GPU预热
-    for _ in tqdm(range(20)):
-        _ = model(input)
 
-    # 测速
-    times = torch.zeros(iterations)  # 存储每轮iteration的时间
-    with torch.no_grad():
-        for iter in tqdm(range(iterations)):
-            starter.record()
-            _ = model(input)
-            ender.record()
-            # 同步GPU时间
-            torch.cuda.synchronize()
-            curr_time = starter.elapsed_time(ender)  # 计算时间
-            times[iter] = curr_time
-            # print(curr_time)
+class OARENet(nn.Module):
+    def __init__(
+        self,
+        pretrained_backbone: bool = True,
+        erase_channels: int = 2,
+    ) -> None:
+        super().__init__()
+        weights = ResNet50_Weights.IMAGENET1K_V2 if pretrained_backbone else None
+        backbone = resnet50(weights=weights)
 
-    mean_time = times.mean().item()
-    print("Inference time: {:.6f}s, FPS: {} ".format(mean_time/1000, 1000 / mean_time))
-    flops,params = profile(model, inputs=(input,))
-    print('FLOPs = ' + str(flops / 1000 ** 3) + 'G')
-    print('Params = ' + str(params / 1000 ** 2) + 'M')
+        self.stem = nn.Sequential(
+            backbone.conv1,
+            backbone.bn1,
+            backbone.relu,
+            backbone.maxpool,
+        )
+        self.layer1 = backbone.layer1
+        self.layer2 = backbone.layer2
+        self.layer3 = backbone.layer3
+        self.layer4 = backbone.layer4
+
+        self.decoder = build_decoder(filters=[256, 512, 1024, 2048])
+        self.erase = build_erase(in_channel=64, erase_channel=erase_channels)
+        self.up = nn.Sequential(
+            nn.ConvTranspose2d(64, 64, kernel_size=3, stride=2, padding=1, output_padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        self.head = nn.Conv2d(64 + erase_channels, 1, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        e1 = self.layer1(x)
+        e2 = self.layer2(e1)
+        e3 = self.layer3(e2)
+        e4 = self.layer4(e3)
+
+        decoded = self.decoder(e1, e2, e3, e4)
+        erase_features = self.erase(decoded)
+        upsampled = self.up(decoded)
+        logits = self.head(torch.cat([erase_features, upsampled], dim=1))
+        return logits
+
+
+GAMSNet_OAM = OARENet
+
